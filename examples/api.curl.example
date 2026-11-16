@@ -1,2 +1,0 @@
-# Nach /etc/node64-cert-bot/api.curl kopieren und Token einsetzen.
-header = "Authorization: Bearer YOUR_NODE64_API_TOKEN"
