@@ -1,0 +1,11 @@
+[Unit]
+Description=Daily Node64 Cert Bot synchronization
+
+[Timer]
+OnCalendar=daily
+RandomizedDelaySec=15m
+Persistent=true
+Unit=node64-cert-bot.service
+
+[Install]
+WantedBy=timers.target

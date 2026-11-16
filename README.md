@@ -1,146 +1,104 @@
 # Node64 Cert Bot
 
-Node64 Cert Bot synchronisiert TLS-Zertifikate, die bereits in Node64 ausgestellt und verwaltet werden, auf Linux-Server. Er ist kein ACME-Client und stellt selbst keine Zertifikate aus. Die Ausstellung und Erneuerung erfolgen in Node64; der Bot holt die jeweils aktuelle Version ab, validiert sie und aktiviert sie lokal.
+Node64 Cert Bot synchronisiert TLS-Zertifikate, die bereits in Node64 ausgestellt und verwaltet werden, auf Linux-Server. Es ist **kein ACME-Client** und stellt selbst keine Zertifikate aus. Die Ausstellung und Erneuerung erfolgen in Node64; der Bot lädt die aktuelle Version, validiert sie und aktiviert sie lokal.
 
 ## Funktionen
 
-- tägliche automatische Synchronisierung über systemd-Timer
-- beliebig viele Zertifikate über einzelne Konfigurationsdateien
-- Node64 API-Zugriff über HTTPS mit eigener CA-Prüfung
-- API-Token in separater root-lesbarer curl-Datei
+- mehrere Zertifikate über einzelne Konfigurationsdateien
+- Node64-API-Zugriff über HTTPS mit eigener API-CA
+- API-Token in separater, rootgeschützter curl-Konfiguration
 - Prüfung von Hostname, Ablaufdatum, Schlüssel-Zertifikat-Paar und Zertifikatskette
+- strikte Konsistenzprüfung: `fullchain.pem` muss exakt `cert.pem` gefolgt von `chain.pem` enthalten
+- ZIP-Prüfung gegen Pfad-Traversal, Symlinks, Verschlüsselung und übergroße Archive
 - versionierte Releases und atomarer `current`-Symlink
-- Reload-Hook nur bei tatsächlicher Zertifikatsänderung
-- Rollback des Symlinks bei fehlgeschlagenem Reload
-- manuelle Befehle für Sync, Check, Liste und Status
-- Deinstallation entfernt Programm und Timer, lässt Konfiguration und Zertifikate bestehen
+- Reload-Hook nur bei Zertifikatsänderung; bei fehlgeschlagenem Reload wird das vorherige Release wiederhergestellt und dessen Reload erneut versucht
+- tägliche Synchronisierung über systemd-Timer
 
 ## Voraussetzungen
 
-Debian/Ubuntu oder ein vergleichbares systemd-Linux mit `bash`, `curl`, `unzip`, `openssl`, `coreutils` und `systemd`.
+Debian/Ubuntu oder vergleichbares systemd-Linux mit Bash, curl, unzip, OpenSSL, Python 3, coreutils und systemd. Installation und Betrieb erfolgen als root.
 
-## Installation
-
-Entpacken und im Projektverzeichnis ausführen:
+## Installation und Upgrade
 
 ```bash
 sudo ./install.sh
 ```
 
-Die Installation legt an:
-
-- `/usr/local/sbin/node64-cert-bot`
-- `/etc/node64-cert-bot/config`
-- `/etc/node64-cert-bot/certs/`
-- systemd-Service und Timer
-
-Die Beispielkonfiguration ist absichtlich neutral und enthält nur Platzhalter.
+Der Installer ersetzt Programm- und systemd-Dateien, überschreibt aber keine vorhandenen Konfigurationen, Tokens oder Zertifikate. Der Timer wird nicht automatisch aktiviert.
 
 ## Konfiguration
 
-### 1. Globale API-Konfiguration
-
-`/etc/node64-cert-bot/config` bearbeiten:
+Globale Datei: `/etc/node64-cert-bot/config` (Vorlage `examples/config.example`)
 
 - `API_BASE_URL`: HTTPS-Basisadresse der Node64-API
 - `API_CURL_CONFIG`: Datei mit dem Bearer-Token
-- `API_CA_FILE`: CA-Zertifikat zur TLS-Prüfung der API
-- `CERT_ROOT`: Ablage der lokalen Releases
+- `API_CA_FILE`: CA-Datei zur TLS-Prüfung der Node64-API
+- `CERT_ROOT`: Basisverzeichnis für Zertifikate
+- `CONNECT_TIMEOUT`, `MAX_TIME`: HTTP-Timeouts
+- `EXPIRY_WARNING_DAYS`: Warnschwelle für `check`
+- `KEEP_RELEASES`: Anzahl jüngster Releases je Zertifikat (2–50, Standard 5); das aktive Release bleibt zusätzlich immer erhalten
 
-### 2. API-Token
-
-Beispiel für `/etc/node64-cert-bot/api.curl`:
+Beispiel für die Token-Datei:
 
 ```text
 header = "Authorization: Bearer YOUR_NODE64_API_TOKEN"
 ```
 
-Datei absichern:
+Sie muss root gehören und Modus `0600` haben. Token niemals in Git einchecken.
 
-```bash
-sudo chown root:root /etc/node64-cert-bot/api.curl
-sudo chmod 600 /etc/node64-cert-bot/api.curl
-```
-
-Token niemals committen oder veröffentlichen.
-
-### 3. Zertifikate definieren
-
-Für jedes Zertifikat eine Datei in `/etc/node64-cert-bot/certs/` anlegen, z. B. `web.conf`. Vorlage: `examples/certificate.example.conf`.
-
-Pflichtwerte:
+Für jedes Zertifikat eine Datei unter `/etc/node64-cert-bot/certs/` anlegen (Vorlage `examples/certificate.example.conf`):
 
 - `NAME`: eindeutiger lokaler Name
-- `CERT_ID`: Zertifikats-ID in Node64
+- `CERT_ID`: numerische Zertifikats-ID in Node64
 - `CERT_HOSTNAME`: erwarteter DNS-Name
+- `DEPLOY_DIR`: optionales Zielverzeichnis; Standard `$CERT_ROOT/$NAME`
+- `BUNDLE_CA_FILE`: optionales CA-Bundle zur Verifikation der vom Zertifikat gelieferten Kette
+- `RELOAD_CMD`: optionaler Shell-Befehl nach Aktivierung
+- `POST_DEPLOY_CMD`: optionaler Shell-Befehl nach erfolgreichem Reload
 
-`RELOAD_CMD` ist optional und wird nur nach Aktivierung eines neuen Zertifikats ausgeführt.
+Konfigurationsdateien werden als root-Shell-Code geladen. Sie müssen root gehören, reguläre Dateien ohne Symlink sein und Modus `0600` haben. Konfigurationsverzeichnisse müssen root gehören und dürfen nicht gruppen-/weltbeschreibbar sein. Reload- und Post-Deploy-Befehle sind ausschließlich vertrauenswürdigen Administratoren vorbehalten.
 
-### 4. API-CA und Zertifikatskette
+## Befehle
 
-`API_CA_FILE` dient ausschließlich zur Prüfung der HTTPS-Verbindung zum Node64-API-Server. Für eine streng private Zertifikatskette kann optional in einer Zertifikatskonfiguration `BUNDLE_CA_FILE` gesetzt werden; diese Variable muss auf eine Datei mit vertrauenswürdigen Root-CA-Zertifikaten zeigen. Ohne diese Option prüft der Bot gegen den System-CA-Speicher und protokolliert eine Warnung, falls die Kette dort nicht validiert werden kann.
+```bash
+sudo node64-cert-bot version
+sudo node64-cert-bot list
+sudo node64-cert-bot sync [NAME]
+sudo node64-cert-bot check [NAME]
+sudo node64-cert-bot status
+```
 
-## Erst testen, dann Automatik aktivieren
+`sync` und `check` verwenden denselben Lock. Fehler eines einzelnen Zertifikats verhindern nicht die Verarbeitung der übrigen Zertifikate; der Gesamtbefehl liefert anschließend einen Fehlerstatus, wenn mindestens ein Zertifikat fehlschlug.
 
-Nach dem Einrichten der Konfiguration:
+## systemd-Härtung und eigene Zielpfade
+
+Der oneshot-Service verwendet unter anderem `ProtectSystem=full`, `ProtectHome=true`, `PrivateDevices=true`, `NoNewPrivileges=true` und eingeschränkte Address Families. Schreibbar sind standardmäßig nur:
+
+- `/var/lib/node64-cert-bot`
+- `/etc/ssl/node64-cert-bot`
+
+Wenn `CERT_ROOT` oder `DEPLOY_DIR` außerhalb dieses Standardpfads liegt, muss der Administrator den entsprechenden Pfad in `ReadWritePaths=` in `/etc/systemd/system/node64-cert-bot.service` ergänzen. Ziele unter `/home` sind durch `ProtectHome=true` absichtlich nicht zugänglich. Danach `systemctl daemon-reload` ausführen. Der Bot prüft Zielpfadkomponenten auf Symlinks, Root-Eigentümer und unsichere Schreibrechte.
+
+Erst nach erfolgreichem manuellen Test den Timer aktivieren:
 
 ```bash
 sudo node64-cert-bot list
 sudo node64-cert-bot sync
 sudo node64-cert-bot check
-```
-
-Wenn der manuelle Lauf erfolgreich war, täglichen Timer aktivieren:
-
-```bash
 sudo systemctl enable --now node64-cert-bot.timer
 ```
 
-Timer prüfen:
+Status und Logs:
 
 ```bash
 systemctl list-timers node64-cert-bot.timer
 systemctl status node64-cert-bot.timer
-```
-
-Logs:
-
-```bash
 journalctl -u node64-cert-bot.service
 ```
 
-## Befehle
+## Release-Aufbewahrung
 
-```text
-node64-cert-bot sync [NAME]    Alle oder ein bestimmtes Zertifikat synchronisieren
-node64-cert-bot check [NAME]   Aktive Zertifikate lokal validieren
-node64-cert-bot list           Konfigurierte Zertifikate anzeigen
-node64-cert-bot status         Timerstatus anzeigen
-node64-cert-bot version        Version anzeigen
-```
-
-## Dateistruktur
-
-Jedes Zertifikat wird getrennt abgelegt:
-
-```text
-<CERT_ROOT>/<NAME>/
-├── current -> releases/<SHA256-Fingerprint>
-└── releases/
-    └── <SHA256-Fingerprint>/
-        ├── cert.pem
-        ├── chain.pem
-        ├── fullchain.pem
-        └── privkey.pem
-```
-
-Dienste müssen `current/fullchain.pem` und `current/privkey.pem` verwenden, damit sie nach dem atomaren Wechsel das neue Zertifikat sehen.
-
-## Wie die automatische Aktualisierung funktioniert
-
-Der systemd-Timer startet den Bot einmal täglich. Der Bot fragt für jedes konfigurierte Zertifikat das zugehörige Node64-Bundle ab. Ist der SHA-256-Fingerprint unverändert, bleibt alles unangetastet. Bei einem neuen Zertifikat wird es geprüft, als neues Release abgelegt, `current` atomar umgeschaltet und optional der konfigurierte Reload-Befehl ausgeführt.
-
-Node64 muss das erneuerte Zertifikat bereits bereitstellen, bevor der Bot es abruft. Der Bot löst keine ACME-Challenges aus und beantragt keine Zertifikate bei Let's Encrypt.
+`KEEP_RELEASES=5` bewahrt standardmäßig die fünf jüngsten fingerprint-basierten Releases je Zertifikat. Das aktive Release wird unabhängig vom Alter niemals entfernt. Es werden ausschließlich root-eigene Verzeichnisse mit gültigem SHA-256-Fingerprint-Namen unter `releases/` bereinigt. Symlinks und fremde Verzeichnisse werden übersprungen. Die Bereinigung läuft erst nach erfolgreichem Reload und `POST_DEPLOY_CMD`. Schlägt der erste Reload fehl, wird `current` auf das vorherige Release zurückgesetzt und der Reload-Befehl mit diesem alten Zertifikat erneut ausgeführt. Schlägt auch dieser zweite Reload fehl, wird dies ausdrücklich protokolliert; der Dienststatus muss dann manuell geprüft werden. Existierte zuvor kein Release, wird `current` entfernt und es gibt kein altes Zertifikat, das erneut geladen werden könnte.
 
 ## Deinstallation
 
@@ -148,16 +106,8 @@ Node64 muss das erneuerte Zertifikat bereits bereitstellen, bevor der Bot es abr
 sudo ./uninstall.sh
 ```
 
-Der Deinstaller entfernt Programm und systemd-Dateien. Konfigurationen, API-Zugangsdaten und Zertifikats-Releases bleiben erhalten.
+Nach Bestätigung werden Timer, Service-Dateien und Programm entfernt. Konfigurationen, API-Zugangsdaten, private Schlüssel und Zertifikats-Releases bleiben erhalten.
 
-## Sicherheit
+## Grenzen / Freigabe
 
-- Die Konfiguration enthält ausführbare Shell-Zuweisungen und muss root gehören sowie nur für root lesbar sein.
-- `RELOAD_CMD` und `POST_DEPLOY_CMD` sind Shell-Befehle. Nur vertrauenswürdige Administratoren dürfen die Konfiguration bearbeiten.
-- Private Schlüssel werden mit Modus `0600` gespeichert.
-- API-Token, private Schlüssel und produktive Konfigurationen gehören nicht in Git.
-- Vor Produktiveinsatz API-Antwortformat und Zertifikatskette mit der eigenen Node64-Installation testen.
-
-## Projektumfang
-
-Ausschließlich Zertifikatsabruf, Validierung, lokale Bereitstellung und Synchronisierung von Node64-Zertifikaten. Kein Monitoring, keine allgemeine Serververwaltung und kein ACME-Server.
+Die lokale Test-Suite deckt Shell-Syntax, ZIP-Sicherheit, Zertifikatsketten-Reihenfolge, Zielpfadschutz, Batch-Fehlerisolation, Release-Aufbewahrung sowie Rollback inklusive erneutem Reload des vorherigen Zertifikats ab. Vor einem produktiven Release sind zusätzlich ein echter Node64-API-Integrationstest, ein Test auf der unterstützten Debian/Ubuntu-Version sowie Tests mit den tatsächlichen Reload-Hooks und den realen Zertifikatsbundles erforderlich. Der lokale Arbeitsstand ist deshalb noch keine Produktionsfreigabe.
