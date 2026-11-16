@@ -1,0 +1,469 @@
+#!/usr/bin/env bash
+# Node64 Cert Bot - Node64 certificate synchronizer
+# Copyright (c) Node64 Cert Bot contributors
+set -Eeuo pipefail
+umask 077
+
+VERSION="0.6.0"
+CONFIG_DIR="${NODE64_CERT_BOT_CONFIG_DIR:-/etc/node64-cert-bot}"
+GLOBAL_CONFIG="$CONFIG_DIR/config"
+CERT_CONFIG_DIR="$CONFIG_DIR/certs"
+STATE_DIR="${NODE64_CERT_BOT_STATE_DIR:-/var/lib/node64-cert-bot}"
+LOCK_FILE="/run/lock/node64-cert-bot.lock"
+LOG_TAG="node64-cert-bot"
+
+log() { printf '[%s] %s\n' "$LOG_TAG" "$*"; }
+warn() { printf '[%s] WARNUNG: %s\n' "$LOG_TAG" "$*" >&2; }
+die() { printf '[%s] FEHLER: %s\n' "$LOG_TAG" "$*" >&2; exit 1; }
+need() { command -v "$1" >/dev/null 2>&1 || die "Programm fehlt: $1"; }
+
+usage() {
+cat <<'USAGE'
+Node64 Cert Bot
+
+Befehle:
+  node64-cert-bot sync [NAME]       Alle Zertifikate oder ein Zertifikat synchronisieren
+  node64-cert-bot check [NAME]      Aktive Zertifikate lokal prüfen
+  node64-cert-bot list              Konfigurierte Zertifikate anzeigen
+  node64-cert-bot status            Dienst-/Timerstatus anzeigen
+  node64-cert-bot version           Version anzeigen
+
+Konfiguration:
+  /etc/node64-cert-bot/config
+  /etc/node64-cert-bot/certs/*.conf
+USAGE
+}
+
+require_root() { [[ ${EUID:-$(id -u)} -eq 0 ]] || die "Bitte als root ausführen."; }
+
+# Config files are executable shell input. Only root-owned, non-symlink files
+# without group/other permissions are accepted. Config directories must not
+# be writable by group or others.
+secure_directory() {
+    local dir="$1" meta owner mode
+    [[ -d "$dir" && ! -L "$dir" ]] || die "Kein sicheres Konfigurationsverzeichnis: $dir"
+    meta="$(stat -c '%u:%a' -- "$dir")" || die "Kann Verzeichnis nicht prüfen: $dir"
+    owner="${meta%%:*}"; mode="${meta#*:}"
+    [[ "$owner" == 0 ]] || die "Verzeichnis muss root gehören: $dir"
+    (( (8#$mode & 0022) == 0 )) || die "Verzeichnis ist für Gruppe/Andere beschreibbar: $dir"
+}
+
+secure_file() {
+    local file="$1" secret="${2:-yes}" meta owner mode
+    [[ -f "$file" && ! -L "$file" ]] || die "Keine reguläre, symlinkfreie Datei: $file"
+    meta="$(stat -c '%u:%a' -- "$file")" || die "Kann Datei nicht prüfen: $file"
+    owner="${meta%%:*}"; mode="${meta#*:}"
+    [[ "$owner" == 0 ]] || die "Datei muss root gehören: $file"
+    if [[ "$secret" == yes ]]; then
+        (( (8#$mode & 0077) == 0 )) || die "Datei darf nur für root zugänglich sein (chmod 600): $file"
+    else
+        (( (8#$mode & 0022) == 0 )) || die "Datei darf nicht gruppen-/weltbeschreibbar sein: $file"
+    fi
+}
+
+secure_config_tree() {
+    secure_directory "$CONFIG_DIR"
+    secure_directory "$CERT_CONFIG_DIR"
+}
+
+# Validate every existing component of a deployment path. Deployment paths are
+# root-managed and may not traverse symlinks or group/world-writable folders.
+secure_root_path() {
+    local path="$1" create="${2:-yes}" component current="/" meta owner mode
+    [[ "$path" == /* && "$path" != *$'\n'* ]] || die "Pfad muss absolut und einzeilig sein: $path"
+    IFS='/' read -r -a components <<< "${path#/}"
+    for component in "${components[@]}"; do
+        [[ -n "$component" ]] || continue
+        [[ "$component" != "." && "$component" != ".." ]] || die "Unsichere Pfadkomponente: $path"
+        current="${current%/}/$component"
+        if [[ -e "$current" || -L "$current" ]]; then
+            [[ ! -L "$current" ]] || die "Symlink in geschütztem Zielpfad nicht erlaubt: $current"
+            [[ -d "$current" ]] || die "Zielpfad-Komponente ist kein Verzeichnis: $current"
+            meta="$(stat -c '%u:%a' -- "$current")" || die "Kann Zielpfad nicht prüfen: $current"
+            owner="${meta%%:*}"; mode="${meta#*:}"
+            [[ "$owner" == 0 ]] || die "Zielpfad muss root gehören: $current"
+            (( (8#$mode & 0022) == 0 || (8#$mode & 01000) != 0 )) || die "Zielpfad ist gruppen-/weltbeschreibbar: $current"
+        else
+            [[ "$create" == yes ]] || die "Zielpfad-Komponente fehlt: $current"
+            install -d -o root -g root -m 755 -- "$current"
+        fi
+    done
+}
+
+validate_chain_layout() {
+    local cert="$1" chain="$2" full="$3"
+    python3 - "$cert" "$chain" "$full" <<'PYCHAIN'
+import base64, hashlib, pathlib, re, sys
+paths = [pathlib.Path(p) for p in sys.argv[1:]]
+def certs(path):
+    data = path.read_bytes()
+    blocks = re.findall(rb"-----BEGIN CERTIFICATE-----\s*(.*?)\s*-----END CERTIFICATE-----", data, re.S)
+    residue = re.sub(rb"-----BEGIN CERTIFICATE-----\s*.*?\s*-----END CERTIFICATE-----", b"", data, flags=re.S)
+    if residue.strip() or not blocks:
+        raise SystemExit(f"Ungültiger PEM-Zertifikatsinhalt: {path}")
+    out=[]
+    for block in blocks:
+        compact = re.sub(rb"\s+", b"", block)
+        try: der = base64.b64decode(compact, validate=True)
+        except Exception: raise SystemExit(f"Ungültige PEM-Kodierung: {path}")
+        out.append(hashlib.sha256(der).hexdigest())
+    return out
+leaf, intermediates, fullchain = [certs(p) for p in paths]
+if len(leaf) != 1:
+    raise SystemExit("cert.pem muss genau ein Zertifikat enthalten")
+if not intermediates:
+    raise SystemExit("chain.pem enthält keine Zertifikate")
+if fullchain != leaf + intermediates:
+    raise SystemExit("fullchain.pem muss exakt cert.pem gefolgt von chain.pem enthalten")
+PYCHAIN
+}
+
+load_global() {
+    secure_file "$GLOBAL_CONFIG" yes
+    # shellcheck disable=SC1090
+    source "$GLOBAL_CONFIG"
+    : "${API_BASE_URL:?API_BASE_URL fehlt}"
+    : "${API_CURL_CONFIG:?API_CURL_CONFIG fehlt}"
+    : "${API_CA_FILE:?API_CA_FILE fehlt}"
+    : "${CERT_ROOT:=/etc/ssl/node64-cert-bot}"
+    : "${CONNECT_TIMEOUT:=15}"
+    : "${MAX_TIME:=120}"
+    : "${EXPIRY_WARNING_DAYS:=30}"
+    : "${KEEP_RELEASES:=5}"
+    [[ "$API_BASE_URL" == https://* && "$API_BASE_URL" != *$'\n'* ]] || die "API_BASE_URL muss eine einzeilige HTTPS-URL sein."
+    [[ "$CONNECT_TIMEOUT" =~ ^[1-9][0-9]*$ ]] || die "CONNECT_TIMEOUT muss eine positive Ganzzahl sein."
+    [[ "$MAX_TIME" =~ ^[1-9][0-9]*$ ]] || die "MAX_TIME muss eine positive Ganzzahl sein."
+    [[ "$EXPIRY_WARNING_DAYS" =~ ^[0-9]+$ ]] || die "EXPIRY_WARNING_DAYS muss eine nichtnegative Ganzzahl sein."
+    [[ "$KEEP_RELEASES" =~ ^[2-9]$|^[1-4][0-9]$|^50$ ]] || die "KEEP_RELEASES muss eine Ganzzahl zwischen 2 und 50 sein."
+    [[ "$CERT_ROOT" == /* ]] || die "CERT_ROOT muss ein absoluter Pfad sein."
+    secure_file "$API_CURL_CONFIG" yes
+    secure_file "$API_CA_FILE" no
+}
+
+load_cert() {
+    local file="$1"
+    unset NAME CERT_ID CERT_HOSTNAME DEPLOY_DIR RELOAD_CMD POST_DEPLOY_CMD BUNDLE_CA_FILE
+    secure_file "$file" yes
+    # shellcheck disable=SC1090
+    source "$file"
+    : "${NAME:?NAME fehlt in $file}"
+    : "${CERT_ID:?CERT_ID fehlt in $file}"
+    : "${CERT_HOSTNAME:?CERT_HOSTNAME fehlt in $file}"
+    : "${DEPLOY_DIR:=$CERT_ROOT/$NAME}"
+    : "${RELOAD_CMD:=}"
+    : "${POST_DEPLOY_CMD:=}"
+    [[ "$NAME" =~ ^[a-zA-Z0-9][a-zA-Z0-9_.-]*$ ]] || die "Ungültiger Zertifikatsname in $file: $NAME"
+    [[ "$CERT_ID" =~ ^[0-9]+$ ]] || die "CERT_ID muss numerisch sein ($file)."
+    [[ "$CERT_HOSTNAME" =~ ^[A-Za-z0-9*.-]+$ && "$CERT_HOSTNAME" != -* ]] || die "Ungültiger Hostname ($file)."
+    [[ "$DEPLOY_DIR" == /* ]] || die "DEPLOY_DIR muss ein absoluter Pfad sein ($file)."
+    if [[ -n "${BUNDLE_CA_FILE:-}" ]]; then secure_file "$BUNDLE_CA_FILE" no; fi
+}
+
+with_lock() {
+    mkdir -p "$(dirname "$LOCK_FILE")"
+    exec 9>"$LOCK_FILE"
+    flock -n 9 || die "Ein anderer Node64 Cert Bot Lauf ist bereits aktiv."
+}
+
+list_configs() {
+    shopt -s nullglob
+    local files=("$CERT_CONFIG_DIR"/*.conf)
+    ((${#files[@]} > 0)) || die "Keine Zertifikatskonfigurationen unter $CERT_CONFIG_DIR gefunden."
+    printf '%s\n' "${files[@]}"
+}
+
+validate_bundle() {
+    local dir="$1" hostname="$2"
+    local cert="$dir/cert.pem" chain="$dir/chain.pem" full="$dir/fullchain.pem" key="$dir/privkey.pem"
+    local cert_pub key_pub first_fp full_fp ca_file="${BUNDLE_CA_FILE:-}"
+    local -a full_certs=()
+    for f in "$cert" "$chain" "$full" "$key"; do [[ -s "$f" ]] || die "Bundle-Datei fehlt oder ist leer: $f"; done
+    openssl x509 -in "$cert" -noout >/dev/null 2>&1 || die "cert.pem ist ungültig."
+    openssl x509 -in "$full" -noout >/dev/null 2>&1 || die "fullchain.pem ist ungültig."
+    openssl pkey -in "$key" -noout >/dev/null 2>&1 || die "privkey.pem ist ungültig."
+    openssl x509 -in "$cert" -checkhost "$hostname" -noout >/dev/null 2>&1 || die "Zertifikat passt nicht zu $hostname."
+    openssl x509 -in "$cert" -checkend 86400 -noout >/dev/null 2>&1 || die "Zertifikat ist abgelaufen oder läuft innerhalb von 24 Stunden ab."
+    cert_pub="$(openssl x509 -in "$cert" -pubkey -noout | openssl pkey -pubin -outform DER 2>/dev/null | sha256sum | awk '{print $1}')"
+    key_pub="$(openssl pkey -in "$key" -pubout -outform DER 2>/dev/null | sha256sum | awk '{print $1}')"
+    [[ -n "$cert_pub" && "$cert_pub" == "$key_pub" ]] || die "Privater Schlüssel passt nicht zum Zertifikat."
+    first_fp="$(openssl x509 -in "$cert" -outform DER | sha256sum | awk '{print $1}')"
+    full_fp="$(openssl x509 -in "$full" -outform DER | sha256sum | awk '{print $1}')"
+    [[ "$first_fp" == "$full_fp" ]] || die "Erstes Zertifikat in fullchain.pem stimmt nicht mit cert.pem überein."
+    # fullchain must contain the leaf followed by exactly the certificates in chain.pem.
+    validate_chain_layout "$cert" "$chain" "$full" || die "fullchain.pem und chain.pem stimmen nicht exakt überein."
+    if [[ -n "$ca_file" ]]; then
+        openssl verify -CAfile "$ca_file" -untrusted "$chain" "$cert" >/dev/null 2>&1 || die "Zertifikatskette konnte mit BUNDLE_CA_FILE nicht validiert werden."
+    else
+        openssl verify -untrusted "$chain" "$cert" >/dev/null 2>&1 || die "Zertifikatskette konnte nicht gegen den lokalen System-CA-Speicher validiert werden."
+    fi
+    printf '%s\n' "$first_fp"
+}
+
+safe_extract() {
+    local archive="$1" dest="$2"
+    # Python's zipfile API lets us reject symlinks, traversal, encrypted files,
+    # excessive entry counts and decompression bombs before writing anything.
+    python3 - "$archive" "$dest" <<'PY'
+import os, pathlib, stat, sys, zipfile
+archive, dest = sys.argv[1:]
+max_entries, max_total, max_file, max_ratio = 128, 64 * 1024 * 1024, 16 * 1024 * 1024, 200
+root = pathlib.Path(dest).resolve()
+with zipfile.ZipFile(archive) as zf:
+    infos = zf.infolist()
+    if not infos or len(infos) > max_entries:
+        raise SystemExit("ZIP enthält keine Dateien oder zu viele Einträge")
+    total = 0
+    for info in infos:
+        name = info.filename
+        p = pathlib.PurePosixPath(name)
+        mode = (info.external_attr >> 16) & 0xFFFF
+        if not name or "\\" in name or p.is_absolute() or any(x in ("", ".", "..") for x in p.parts):
+            raise SystemExit("Unsicherer ZIP-Pfad: " + repr(name))
+        if stat.S_ISLNK(mode):
+            raise SystemExit("ZIP-Symlink nicht erlaubt: " + repr(name))
+        if info.flag_bits & 1:
+            raise SystemExit("Verschlüsselte ZIP-Einträge sind nicht erlaubt")
+        if info.file_size > max_file:
+            raise SystemExit("ZIP-Datei überschreitet Größenlimit")
+        total += info.file_size
+        if total > max_total:
+            raise SystemExit("ZIP überschreitet Gesamtgrößenlimit")
+        if info.compress_size == 0 and info.file_size > 0:
+            raise SystemExit("Ungültiges ZIP-Kompressionsverhältnis")
+        if info.compress_size and info.file_size / info.compress_size > max_ratio:
+            raise SystemExit("ZIP-Kompressionsverhältnis überschreitet Limit")
+        target = (root / pathlib.Path(*p.parts)).resolve()
+        if target != root and root not in target.parents:
+            raise SystemExit("ZIP-Pfad verlässt Zielverzeichnis")
+    zf.extractall(root)
+PY
+    if [[ ! -s "$dest/cert.pem" ]]; then
+        local -a matches=()
+        while IFS= read -r -d '' f; do matches+=("$f"); done < <(find "$dest" -type f -name cert.pem -print0)
+        ((${#matches[@]} == 1)) || die "ZIP-Bundle hat keine eindeutige cert.pem."
+        dest="$(dirname "${matches[0]}")"
+    fi
+    printf '%s\n' "$dest"
+}
+
+
+# Keep the newest N valid fingerprint releases and always preserve current.
+# Only root-owned, real directories with a 64-hex fingerprint name are eligible.
+prune_releases() {
+    local deploy="$1" keep="$2" current_target="" entry path owner removed=0
+    local -a candidates=()
+    [[ "$keep" =~ ^[2-9]$|^[1-4][0-9]$|^50$ ]] || die "Ungültiger Retention-Wert: $keep"
+    [[ -L "$deploy/current" ]] && current_target="$(readlink -f "$deploy/current" 2>/dev/null || true)"
+    [[ -d "$deploy/releases" && ! -L "$deploy/releases" ]] || return 0
+    while IFS= read -r entry; do candidates+=("$entry"); done < <(
+        find "$deploy/releases" -mindepth 1 -maxdepth 1 -type d -regextype posix-extended \
+            -regex '.*/[a-fA-F0-9]{64}' -printf '%T@ %p\n' | sort -rn | cut -d' ' -f2-
+    )
+    local index=0
+    for path in "${candidates[@]}"; do
+        index=$((index + 1))
+        [[ "$path" == "$current_target" ]] && continue
+        (( index <= keep )) && continue
+        [[ ! -L "$path" && -d "$path" ]] || continue
+        owner="$(stat -c '%u' -- "$path" 2>/dev/null || true)"
+        [[ "$owner" == 0 ]] || { warn "Überspringe Release mit fremdem Eigentümer: $path"; continue; }
+        rm -rf --one-file-system -- "$path"
+        removed=$((removed + 1))
+    done
+    (( removed == 0 )) || log "Release-Aufbewahrung: $removed altes Release(s) entfernt; $keep werden behalten (aktives Release zusätzlich geschützt)."
+}
+
+switch_current() {
+    local deploy="$1" release="$2" temp
+    temp="$deploy/.current.$$"
+    rm -f -- "$temp"
+    ln -s "$release" "$temp"
+    mv -Tf -- "$temp" "$deploy/current"
+}
+
+restore_current() {
+    local deploy="$1" previous="$2" temp
+    temp="$deploy/.current.rollback.$$"
+    if [[ -n "$previous" ]]; then
+        rm -f -- "$temp"
+        ln -s "$previous" "$temp"
+        mv -Tf -- "$temp" "$deploy/current"
+    else
+        rm -f -- "$deploy/current"
+    fi
+}
+
+# Restore the previous symlink and ask the service to reload that certificate.
+# A failed first reload may have left the service in an uncertain state, so
+# restoring the filesystem pointer alone is not sufficient.
+rollback_after_reload_failure() {
+    local deploy="$1" previous="$2" reload="$3" name="$4"
+    restore_current "$deploy" "$previous"
+    if [[ -z "$previous" ]]; then
+        warn "[$name] Kein vorheriges Release vorhanden; current wurde entfernt. Ein Reload des alten Zertifikats ist nicht möglich."
+        return 1
+    fi
+    log "[$name] Vorheriges Release wiederhergestellt; versuche erneuten Reload..."
+    if [[ -n "$reload" ]] && bash -c "$reload"; then
+        log "[$name] Vorheriges Zertifikat wurde erneut geladen."
+        return 0
+    fi
+    warn "[$name] Symlink ist zurückgesetzt, aber der erneute Reload des vorherigen Zertifikats ist fehlgeschlagen. Dienststatus manuell prüfen."
+    return 1
+}
+
+# Run each certificate in a subshell: die/exit then fails only this item and
+# the batch loop can continue with the remaining certificate configurations.
+sync_one() (
+    local config_file="$1"
+    local work="" name id host deploy reload post archive extracted fingerprint release current previous="" temp_link url
+    cleanup_sync() { [[ -z "$work" ]] || rm -rf -- "$work"; }
+    trap cleanup_sync EXIT
+    load_cert "$config_file"
+    name="$NAME"; id="$CERT_ID"; host="$CERT_HOSTNAME"; deploy="$DEPLOY_DIR"
+    reload="$RELOAD_CMD"; post="$POST_DEPLOY_CMD"
+    url="${API_BASE_URL%/}/api/certs/${id}/bundle?format=zip"
+    secure_root_path "$deploy"
+    secure_root_path "$STATE_DIR"
+    install -d -o root -g root -m 700 "$STATE_DIR"
+    work="$(mktemp -d "${STATE_DIR}/work.XXXXXX")"
+    archive="$work/bundle.zip"
+    mkdir -p "$work/extracted"
+    secure_root_path "$deploy/releases"
+    log "[$name] Prüfe Zertifikatsbundle von Node64..."
+    curl --silent --show-error --fail --connect-timeout "$CONNECT_TIMEOUT" --max-time "$MAX_TIME" \
+        --config "$API_CURL_CONFIG" --cacert "$API_CA_FILE" --output "$archive" "$url" \
+        || die "[$name] Abruf von Node64 fehlgeschlagen."
+    unzip -tq "$archive" >/dev/null 2>&1 || die "[$name] API-Antwort ist kein gültiges ZIP."
+    extracted="$(safe_extract "$archive" "$work/extracted")"
+    fingerprint="$(validate_bundle "$extracted" "$host")"
+    release="$deploy/releases/$fingerprint"; current="$deploy/current"
+    if [[ -e "$current" && ! -L "$current" ]]; then die "current existiert, ist aber kein Symlink: $current"; fi
+    if [[ -L "$current" ]]; then
+        local current_target
+        current_target="$(readlink -f "$current" 2>/dev/null || true)"
+        [[ -n "$current_target" && "$current_target" == "$deploy/releases/"* ]] || die "current verweist außerhalb des verwalteten Release-Verzeichnisses."
+    fi
+    if [[ -L "$current" ]] && [[ "$(readlink -f "$current" 2>/dev/null || true)" == "$release" ]]; then
+        log "[$name] Zertifikat unverändert ($fingerprint); kein Reload nötig."
+        exit 0
+    fi
+    if [[ -L "$release" ]]; then die "Release-Verzeichnis darf kein Symlink sein: $release"; fi
+    if [[ -e "$release" ]]; then
+        [[ -d "$release" ]] || die "Release-Pfad ist kein Verzeichnis: $release"
+        local release_owner
+        release_owner="$(stat -c '%u' -- "$release")"
+        [[ "$release_owner" == 0 ]] || die "Release-Verzeichnis muss root gehören: $release"
+    fi
+    if [[ ! -d "$release" ]]; then
+        install -d -o root -g root -m 755 "$release"
+        install -o root -g root -m 644 "$extracted/cert.pem" "$release/cert.pem"
+        install -o root -g root -m 644 "$extracted/chain.pem" "$release/chain.pem"
+        install -o root -g root -m 644 "$extracted/fullchain.pem" "$release/fullchain.pem"
+        install -o root -g root -m 600 "$extracted/privkey.pem" "$release/privkey.pem"
+    else
+        validate_bundle "$release" "$host" >/dev/null
+    fi
+    [[ -L "$current" ]] && previous="$(readlink "$current")" || true
+    switch_current "$deploy" "$release"
+    if [[ -n "$reload" ]]; then
+        log "[$name] Führe Reload-Befehl aus..."
+        if ! bash -c "$reload"; then
+            warn "[$name] Reload fehlgeschlagen; stelle vorheriges Release wieder her."
+            rollback_after_reload_failure "$deploy" "$previous" "$reload" "$name" || true
+            die "[$name] Reload fehlgeschlagen; Rollback wurde versucht."
+        fi
+    fi
+    if [[ -n "$post" ]] && ! bash -c "$post"; then
+        warn "[$name] POST_DEPLOY_CMD ist fehlgeschlagen. Das Zertifikat bleibt aktiviert."
+        die "[$name] Post-Deploy-Befehl fehlgeschlagen."
+    fi
+    prune_releases "$deploy" "$KEEP_RELEASES"
+    log "[$name] Neues Zertifikat aktiviert."
+    log "[$name] Hostname: $host"
+    log "[$name] SHA-256:  $fingerprint"
+    log "[$name] Release:  $release"
+)
+
+check_one() (
+    local config_file="$1" name host deploy current resolved fp end_epoch now days
+    load_cert "$config_file"
+    name="$NAME"; host="$CERT_HOSTNAME"; deploy="$DEPLOY_DIR"; current="$deploy/current"
+    secure_root_path "$deploy" no
+    [[ -L "$current" ]] || { warn "[$name] Kein aktives Zertifikat ($current)."; exit 1; }
+    resolved="$(readlink -f "$current" 2>/dev/null || true)"
+    [[ -n "$resolved" && -d "$resolved" && "$resolved" == "$deploy/releases/"* ]] || { warn "[$name] Release-Verzeichnis fehlt, liegt außerhalb von releases oder Symlink ist defekt."; exit 1; }
+    fp="$(validate_bundle "$resolved" "$host")"
+    end_epoch="$(date -d "$(openssl x509 -in "$resolved/cert.pem" -noout -enddate | cut -d= -f2-)" +%s)"
+    now="$(date +%s)"; days=$(( (end_epoch - now) / 86400 ))
+    log "[$name] OK – $host – $days Tage verbleibend – SHA-256 $fp"
+    if (( days <= EXPIRY_WARNING_DAYS )); then warn "[$name] Zertifikat läuft innerhalb von $EXPIRY_WARNING_DAYS Tagen ab."; fi
+)
+
+main() {
+    local command="${1:-}" wanted="${2:-}" f failures=0
+    # Purely local informational commands must not depend on API credentials.
+    case "$command" in
+        version) echo "Node64 Cert Bot $VERSION"; return 0 ;;
+        -h|--help|help|"") usage; return 0 ;;
+        status)
+            echo "Node64 Cert Bot $VERSION"
+            systemctl is-enabled node64-cert-bot.timer 2>/dev/null || true
+            systemctl is-active node64-cert-bot.timer 2>/dev/null || true
+            systemctl list-timers node64-cert-bot.timer --no-pager 2>/dev/null || true
+            return 0 ;;
+        list|sync|check) ;;
+        *) usage >&2; return 2 ;;
+    esac
+    require_root
+    need stat; need flock; need openssl; need sha256sum; need awk; need find
+    [[ -d "$CONFIG_DIR" && -d "$CERT_CONFIG_DIR" ]] || die "Konfigurationsverzeichnis fehlt: $CONFIG_DIR"
+    secure_config_tree
+    if [[ "$command" == list ]]; then
+        shopt -s nullglob
+        local -a files=("$CERT_CONFIG_DIR"/*.conf)
+        printf '%-24s %-10s %s\n' "NAME" "ID" "HOSTNAME"
+        for f in "${files[@]}"; do
+            load_cert_for_list "$f"
+        done
+        return 0
+    fi
+    load_global
+    if [[ "$command" == sync ]]; then
+        for cmd in curl unzip python3 install date; do need "$cmd"; done
+        with_lock
+    elif [[ "$command" == check ]]; then
+        need date; need python3
+        with_lock
+    fi
+    local -a files=()
+    if [[ -n "$wanted" ]]; then
+        [[ "$wanted" =~ ^[a-zA-Z0-9][a-zA-Z0-9_.-]*$ ]] || die "Ungültiger Zertifikatsname: $wanted"
+        [[ -f "$CERT_CONFIG_DIR/$wanted.conf" && ! -L "$CERT_CONFIG_DIR/$wanted.conf" ]] || die "Unbekanntes Zertifikat: $wanted"
+        files=("$CERT_CONFIG_DIR/$wanted.conf")
+    else
+        shopt -s nullglob
+        files=("$CERT_CONFIG_DIR"/*.conf)
+    fi
+    ((${#files[@]} > 0)) || die "Keine Zertifikatskonfigurationen gefunden."
+    for f in "${files[@]}"; do
+        if [[ "$command" == sync ]]; then sync_one "$f" || failures=$((failures + 1))
+        else check_one "$f" || failures=$((failures + 1)); fi
+    done
+    (( failures == 0 )) || die "$failures Zertifikat(e) konnten nicht verarbeitet werden."
+}
+
+load_cert_for_list() {
+    local file="$1"
+    unset NAME CERT_ID CERT_HOSTNAME DEPLOY_DIR RELOAD_CMD POST_DEPLOY_CMD BUNDLE_CA_FILE
+    secure_file "$file" yes
+    # shellcheck disable=SC1090
+    source "$file"
+    : "${NAME:?NAME fehlt in $file}"; : "${CERT_ID:?CERT_ID fehlt in $file}"; : "${CERT_HOSTNAME:?CERT_HOSTNAME fehlt in $file}"
+    [[ "$NAME" =~ ^[a-zA-Z0-9][a-zA-Z0-9_.-]*$ && "$CERT_ID" =~ ^[0-9]+$ ]] || die "Ungültige Konfiguration: $file"
+    printf '%-24s %-10s %s\n' "$NAME" "$CERT_ID" "$CERT_HOSTNAME"
+}
+
+if [[ "${NODE64_CERT_BOT_TEST_SOURCE_ONLY:-0}" != 1 ]]; then
+    main "$@"
+fi

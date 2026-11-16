@@ -1,0 +1,19 @@
+PASS: Bash syntax (Hauptskript, Installer, Deinstaller, Tests)
+PASS: version works without API configuration
+PASS: list works without API credentials
+PASS: rejects group/world-readable executable config
+PASS: extracts a valid archive
+PASS: rejects ZIP path traversal
+PASS: rejects ZIP symlinks
+PASS: accepts exact leaf-plus-chain fullchain layout
+PASS: rejects incorrect fullchain certificate order
+PASS: rejects incomplete fullchain
+PASS: rejects symlinked deployment path components
+PASS: rejects group/world-writable deployment path components
+PASS: continues batch processing after an individual certificate failure
+PASS: retention keeps newest releases and protects active release
+PASS: atomic activation and rollback restore previous release
+PASS: reload failure restores previous release and retries service reload
+
+Ergebnis: 16 lokale Regressionstests erfolgreich.
+Nicht durchgeführt: echte Node64-API, produktive Zertifikate, realer Dienst-Reload, vollständige Debian-/Ubuntu-VM-Integration, ShellCheck (nicht installiert).
