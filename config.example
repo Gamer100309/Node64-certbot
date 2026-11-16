@@ -1,0 +1,33 @@
+# Node64 Cert Bot – neutrale Beispielkonfiguration
+# Nach der Installation nach /etc/node64-cert-bot/config kopieren
+# und alle Beispielwerte an die eigene Umgebung anpassen.
+# Dateirechte: root:root, 0600
+
+# Basis-URL der Node64-API (Beispieladresse, unbedingt ersetzen).
+API_BASE_URL="https://node64.example.com"
+
+# ID des Zertifikats in Node64 (Beispielwert, unbedingt ersetzen).
+CERT_ID="123"
+
+# DNS-Name, für den das Zertifikat ausgestellt sein soll.
+CERT_HOSTNAME="example.com"
+
+# Lokale curl-Konfiguration mit dem Authorization-Bearer-Header.
+# Beispielinhalt der Datei:
+# header = "Authorization: Bearer YOUR_API_TOKEN"
+API_CURL_CONFIG="/etc/node64-cert-bot/api.curl"
+
+# CA-Zertifikat zur Prüfung des HTTPS-Zertifikats der Node64-API.
+API_CA_FILE="/etc/node64-cert-bot/node64-api-ca.pem"
+
+# Zielverzeichnis für versionierte Zertifikats-Releases.
+CERT_ROOT="/etc/ssl/node64"
+
+# Temporäre Arbeitsdateien und Statusdaten.
+STATE_DIR="/var/lib/node64-cert-bot"
+
+# Optionaler Reload-Befehl bei erfolgreichem Zertifikatswechsel.
+# Beispiele:
+# RELOAD_CMD="systemctl reload nginx"
+# RELOAD_CMD="systemctl restart example-service"
+RELOAD_CMD=""

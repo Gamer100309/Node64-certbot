@@ -1,0 +1,295 @@
+#!/usr/bin/env bash
+# Node64 Cert Bot - Node64 certificate synchronizer
+# Copyright (c) Node64 Cert Bot contributors
+set -Eeuo pipefail
+umask 077
+
+VERSION="0.2.0"
+CONFIG_DIR="${NODE64_CERT_BOT_CONFIG_DIR:-/etc/node64-cert-bot}"
+GLOBAL_CONFIG="$CONFIG_DIR/config"
+CERT_CONFIG_DIR="$CONFIG_DIR/certs"
+STATE_DIR="${NODE64_CERT_BOT_STATE_DIR:-/var/lib/node64-cert-bot}"
+LOCK_FILE="/run/lock/node64-cert-bot.lock"
+LOG_TAG="node64-cert-bot"
+
+log() { printf '[%s] %s\n' "$LOG_TAG" "$*"; }
+warn() { printf '[%s] WARNUNG: %s\n' "$LOG_TAG" "$*" >&2; }
+die() { printf '[%s] FEHLER: %s\n' "$LOG_TAG" "$*" >&2; exit 1; }
+need() { command -v "$1" >/dev/null 2>&1 || die "Programm fehlt: $1"; }
+
+usage() {
+cat <<'EOF'
+Node64 Cert Bot
+
+Befehle:
+  node64-cert-bot sync [NAME]       Alle Zertifikate oder ein Zertifikat synchronisieren
+  node64-cert-bot check [NAME]      Aktive Zertifikate lokal prüfen
+  node64-cert-bot list              Konfigurierte Zertifikate anzeigen
+  node64-cert-bot status            Dienst-/Timerstatus anzeigen
+  node64-cert-bot version           Version anzeigen
+
+Konfiguration:
+  /etc/node64-cert-bot/config
+  /etc/node64-cert-bot/certs/*.conf
+EOF
+}
+
+require_root() { [[ ${EUID:-$(id -u)} -eq 0 ]] || die "Bitte als root ausführen."; }
+load_global() {
+    [[ -r "$GLOBAL_CONFIG" ]] || die "Globale Konfiguration fehlt: $GLOBAL_CONFIG"
+    # shellcheck disable=SC1090
+    source "$GLOBAL_CONFIG"
+    : "${API_BASE_URL:?API_BASE_URL fehlt}"
+    : "${API_CURL_CONFIG:?API_CURL_CONFIG fehlt}"
+    : "${API_CA_FILE:?API_CA_FILE fehlt}"
+    : "${CERT_ROOT:=/etc/ssl/node64-cert-bot}"
+    : "${CONNECT_TIMEOUT:=15}"
+    : "${MAX_TIME:=120}"
+    : "${EXPIRY_WARNING_DAYS:=30}"
+    [[ "$API_BASE_URL" == https://* ]] || die "API_BASE_URL muss HTTPS verwenden."
+    [[ -r "$API_CURL_CONFIG" ]] || die "API-Curl-Konfiguration nicht lesbar: $API_CURL_CONFIG"
+    [[ -r "$API_CA_FILE" ]] || die "API-CA-Datei nicht lesbar: $API_CA_FILE"
+}
+
+load_cert() {
+    local file="$1"
+    unset NAME CERT_ID CERT_HOSTNAME DEPLOY_DIR RELOAD_CMD POST_DEPLOY_CMD BUNDLE_CA_FILE
+    # shellcheck disable=SC1090
+    source "$file"
+    : "${NAME:?NAME fehlt in $file}"
+    : "${CERT_ID:?CERT_ID fehlt in $file}"
+    : "${CERT_HOSTNAME:?CERT_HOSTNAME fehlt in $file}"
+    : "${DEPLOY_DIR:=$CERT_ROOT/$NAME}"
+    : "${RELOAD_CMD:=}"
+    : "${POST_DEPLOY_CMD:=}"
+    [[ "$NAME" =~ ^[a-zA-Z0-9][a-zA-Z0-9_.-]*$ ]] || die "Ungültiger Zertifikatsname in $file: $NAME"
+    [[ "$CERT_ID" =~ ^[0-9]+$ ]] || die "CERT_ID muss numerisch sein ($file)."
+    [[ "$CERT_HOSTNAME" != *"/"* ]] || die "Ungültiger Hostname ($file)."
+    [[ "$DEPLOY_DIR" == /* ]] || die "DEPLOY_DIR muss ein absoluter Pfad sein ($file)."
+}
+
+list_configs() {
+    shopt -s nullglob
+    local files=("$CERT_CONFIG_DIR"/*.conf)
+    ((${#files[@]} > 0)) || die "Keine Zertifikatskonfigurationen unter $CERT_CONFIG_DIR gefunden."
+    printf '%s\n' "${files[@]}"
+}
+
+with_lock() {
+    mkdir -p "$(dirname "$LOCK_FILE")"
+    exec 9>"$LOCK_FILE"
+    flock -n 9 || die "Ein anderer Node64 Cert Bot Lauf ist bereits aktiv."
+}
+
+validate_bundle() {
+    local dir="$1" hostname="$2"
+    local cert="$dir/cert.pem" chain="$dir/chain.pem"
+    local full="$dir/fullchain.pem" key="$dir/privkey.pem"
+    local cert_pub key_pub first_fp full_fp
+    local ca_file="${BUNDLE_CA_FILE:-}"
+
+    for f in "$cert" "$chain" "$full" "$key"; do
+        [[ -s "$f" ]] || die "Bundle-Datei fehlt oder ist leer: $f"
+    done
+    openssl x509 -in "$cert" -noout >/dev/null 2>&1 || die "cert.pem ist ungültig."
+    openssl x509 -in "$full" -noout >/dev/null 2>&1 || die "fullchain.pem ist ungültig."
+    openssl pkey -in "$key" -noout >/dev/null 2>&1 || die "privkey.pem ist ungültig."
+    openssl x509 -in "$cert" -checkhost "$hostname" -noout >/dev/null 2>&1 \
+        || die "Zertifikat passt nicht zu $hostname."
+    openssl x509 -in "$cert" -checkend 86400 -noout >/dev/null 2>&1 \
+        || die "Zertifikat ist abgelaufen oder läuft innerhalb von 24 Stunden ab."
+
+    cert_pub="$(openssl x509 -in "$cert" -pubkey -noout | openssl pkey -pubin -outform DER 2>/dev/null | sha256sum | awk '{print $1}')"
+    key_pub="$(openssl pkey -in "$key" -pubout -outform DER 2>/dev/null | sha256sum | awk '{print $1}')"
+    [[ "$cert_pub" == "$key_pub" ]] || die "Privater Schlüssel passt nicht zum Zertifikat."
+
+    first_fp="$(openssl x509 -in "$cert" -outform DER | sha256sum | awk '{print $1}')"
+    full_fp="$(openssl x509 -in "$full" -outform DER | sha256sum | awk '{print $1}')"
+    [[ "$first_fp" == "$full_fp" ]] || die "Erstes Zertifikat in fullchain.pem stimmt nicht mit cert.pem überein."
+
+    # Validate issuer/signature chain. BUNDLE_CA_FILE is optional and must
+    # contain the trusted root CA(s) for the issued certificate.
+    if [[ -n "$ca_file" ]]; then
+        openssl verify -CAfile "$ca_file" -untrusted "$chain" "$cert" >/dev/null 2>&1 \
+            || die "Zertifikatskette konnte mit BUNDLE_CA_FILE nicht validiert werden."
+    else
+        openssl verify -untrusted "$chain" "$cert" >/dev/null 2>&1 \
+            || die "Zertifikatskette konnte nicht gegen den lokalen System-CA-Speicher validiert werden."
+    fi
+    printf '%s\n' "$first_fp"
+}
+
+safe_extract() {
+    local archive="$1" dest="$2" entry
+    while IFS= read -r entry; do
+        [[ -n "$entry" ]] || continue
+        [[ "$entry" != /* ]] || die "Absoluter Pfad im ZIP-Archiv abgelehnt."
+        case "/$entry/" in */../*|*/././*) die "Unsicherer Pfad im ZIP-Archiv abgelehnt: $entry";; esac
+    done < <(unzip -Z1 "$archive")
+    unzip -oq "$archive" -d "$dest"
+    # Support archives which contain a single top-level directory.
+    if [[ ! -s "$dest/cert.pem" ]]; then
+        local -a matches=()
+        while IFS= read -r -d '' f; do matches+=("$f"); done < <(find "$dest" -type f -name cert.pem -print0)
+        ((${#matches[@]} == 1)) || die "ZIP-Bundle hat keine eindeutige cert.pem."
+        dest="$(dirname "${matches[0]}")"
+    fi
+    printf '%s\n' "$dest"
+}
+
+sync_one() {
+    local config_file="$1"
+    load_cert "$config_file"
+    local name="$NAME" id="$CERT_ID" host="$CERT_HOSTNAME" deploy="$DEPLOY_DIR"
+    local reload="$RELOAD_CMD" post="$POST_DEPLOY_CMD"
+    local work archive extracted fingerprint release current previous="" temp_link
+    local url="${API_BASE_URL%/}/api/certs/${id}/bundle?format=zip"
+
+    work="$(mktemp -d "${STATE_DIR}/work.XXXXXX")"
+    archive="$work/bundle.zip"
+    mkdir -p "$work/extracted" "$deploy/releases"
+
+    log "[$name] Prüfe Zertifikatsbundle von Node64..."
+    if ! curl --silent --show-error --fail \
+        --connect-timeout "$CONNECT_TIMEOUT" --max-time "$MAX_TIME" \
+        --config "$API_CURL_CONFIG" --cacert "$API_CA_FILE" \
+        --output "$archive" "$url"; then
+        rm -rf "$work"
+        die "[$name] Abruf von Node64 fehlgeschlagen."
+    fi
+    unzip -tq "$archive" >/dev/null 2>&1 || { rm -rf "$work"; die "[$name] API-Antwort ist kein gültiges ZIP."; }
+    extracted="$(safe_extract "$archive" "$work/extracted")"
+    fingerprint="$(validate_bundle "$extracted" "$host")"
+    release="$deploy/releases/$fingerprint"
+    current="$deploy/current"
+
+    if [[ -L "$current" ]] && [[ "$(readlink -f "$current")" == "$release" ]]; then
+        log "[$name] Zertifikat unverändert ($fingerprint); kein Reload nötig."
+        rm -rf "$work"
+        return 0
+    fi
+
+    if [[ ! -d "$release" ]]; then
+        install -d -o root -g root -m 755 "$release"
+        install -o root -g root -m 644 "$extracted/cert.pem" "$release/cert.pem"
+        install -o root -g root -m 644 "$extracted/chain.pem" "$release/chain.pem"
+        install -o root -g root -m 644 "$extracted/fullchain.pem" "$release/fullchain.pem"
+        install -o root -g root -m 600 "$extracted/privkey.pem" "$release/privkey.pem"
+    else
+        validate_bundle "$release" "$host" >/dev/null
+    fi
+
+    [[ -L "$current" ]] && previous="$(readlink "$current")" || true
+    temp_link="$deploy/.current.$$"
+    ln -s "$release" "$temp_link"
+    mv -Tf "$temp_link" "$current"
+
+    if [[ -n "$reload" ]]; then
+        log "[$name] Führe Reload-Befehl aus..."
+        if ! bash -c "$reload"; then
+            warn "[$name] Reload fehlgeschlagen; stelle vorheriges Release wieder her."
+            if [[ -n "$previous" ]]; then
+                ln -s "$previous" "$temp_link.rollback"
+                mv -Tf "$temp_link.rollback" "$current"
+            else
+                rm -f "$current"
+            fi
+            rm -rf "$work"
+            die "[$name] Reload fehlgeschlagen; Rollback ausgeführt."
+        fi
+    fi
+    if [[ -n "$post" ]]; then
+        if ! bash -c "$post"; then
+            warn "[$name] POST_DEPLOY_CMD ist fehlgeschlagen. Das Zertifikat bleibt aktiviert."
+            rm -rf "$work"
+            die "[$name] Post-Deploy-Befehl fehlgeschlagen."
+        fi
+    fi
+
+    log "[$name] Neues Zertifikat aktiviert."
+    log "[$name] Hostname: $host"
+    log "[$name] SHA-256:  $fingerprint"
+    log "[$name] Release:  $release"
+    rm -rf "$work"
+}
+
+check_one() {
+    local config_file="$1"
+    load_cert "$config_file"
+    local name="$NAME" host="$CERT_HOSTNAME" deploy="$DEPLOY_DIR"
+    local current="$deploy/current" resolved fp end_epoch now days
+    [[ -L "$current" ]] || { warn "[$name] Kein aktives Zertifikat ($current)."; return 1; }
+    resolved="$(readlink -f "$current")"
+    [[ -d "$resolved" ]] || { warn "[$name] Release-Verzeichnis fehlt."; return 1; }
+    fp="$(validate_bundle "$resolved" "$host")"
+    end_epoch="$(date -d "$(openssl x509 -in "$resolved/cert.pem" -noout -enddate | cut -d= -f2-)" +%s)"
+    now="$(date +%s)"
+    days=$(( (end_epoch - now) / 86400 ))
+    log "[$name] OK – $host – $days Tage verbleibend – SHA-256 $fp"
+    if (( days <= EXPIRY_WARNING_DAYS )); then
+        warn "[$name] Zertifikat läuft innerhalb von $EXPIRY_WARNING_DAYS Tagen ab."
+    fi
+}
+
+main() {
+    require_root
+    for cmd in curl unzip openssl sha256sum flock install date find; do need "$cmd"; done
+    [[ -d "$CONFIG_DIR" ]] || die "Konfigurationsverzeichnis fehlt: $CONFIG_DIR"
+    load_global
+    mkdir -p "$STATE_DIR"
+    case "${1:-}" in
+        sync)
+            with_lock
+            local wanted="${2:-}" f
+            local -a files=()
+            if [[ -n "$wanted" ]]; then
+                [[ -r "$CERT_CONFIG_DIR/$wanted.conf" ]] || die "Unbekanntes Zertifikat: $wanted"
+                files=("$CERT_CONFIG_DIR/$wanted.conf")
+            else
+                shopt -s nullglob
+                files=("$CERT_CONFIG_DIR"/*.conf)
+            fi
+            ((${#files[@]} > 0)) || die "Keine Zertifikatskonfigurationen gefunden."
+            local failures=0
+            for f in "${files[@]}"; do
+                if ! sync_one "$f"; then failures=$((failures + 1)); fi
+            done
+            (( failures == 0 )) || die "$failures Zertifikat(e) konnten nicht synchronisiert werden."
+            ;;
+        check)
+            local wanted="${2:-}" f
+            local -a files=()
+            if [[ -n "$wanted" ]]; then
+                [[ -r "$CERT_CONFIG_DIR/$wanted.conf" ]] || die "Unbekanntes Zertifikat: $wanted"
+                files=("$CERT_CONFIG_DIR/$wanted.conf")
+            else
+                shopt -s nullglob
+                files=("$CERT_CONFIG_DIR"/*.conf)
+            fi
+            ((${#files[@]} > 0)) || die "Keine Zertifikatskonfigurationen gefunden."
+            local failures=0
+            for f in "${files[@]}"; do check_one "$f" || failures=$((failures + 1)); done
+            (( failures == 0 )) || exit 1
+            ;;
+        list)
+            shopt -s nullglob
+            local -a files=("$CERT_CONFIG_DIR"/*.conf)
+            printf '%-24s %-10s %s\n' "NAME" "ID" "HOSTNAME"
+            local f
+            for f in "${files[@]}"; do
+                load_cert "$f"
+                printf '%-24s %-10s %s\n' "$NAME" "$CERT_ID" "$CERT_HOSTNAME"
+            done
+            ;;
+        status)
+            echo "Node64 Cert Bot $VERSION"
+            systemctl is-enabled node64-cert-bot.timer 2>/dev/null || true
+            systemctl is-active node64-cert-bot.timer 2>/dev/null || true
+            systemctl list-timers node64-cert-bot.timer --no-pager 2>/dev/null || true
+            ;;
+        version) echo "Node64 Cert Bot $VERSION" ;;
+        -h|--help|help|"") usage ;;
+        *) usage; exit 2 ;;
+    esac
+}
+main "$@"

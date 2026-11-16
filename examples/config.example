@@ -1,0 +1,14 @@
+# Globale Node64-API-Konfiguration – alle Werte sind Platzhalter.
+API_BASE_URL="https://node64.example.com"
+API_CURL_CONFIG="/etc/node64-cert-bot/api.curl"
+API_CA_FILE="/etc/node64-cert-bot/node64-api-ca.pem"
+
+# Globale Ablage. Je Zertifikat entsteht ein eigenes Unterverzeichnis.
+CERT_ROOT="/etc/ssl/node64-cert-bot"
+
+# HTTP-Timeouts
+CONNECT_TIMEOUT=15
+MAX_TIME=120
+
+# Warnung bei lokalem Check, wenn das Zertifikat bald abläuft.
+EXPIRY_WARNING_DAYS=30
